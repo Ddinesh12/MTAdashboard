@@ -1,0 +1,6 @@
+pandas>=2.2
+requests>=2.32
+psycopg[binary]>=3.2
+python-dotenv>=1.0
+SQLAlchemy>=2.0
+streamlit>=1.36
