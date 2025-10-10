@@ -32,14 +32,10 @@ from src.load.to_postgres import upsert
 # ------------------------
 # Windows
 # ------------------------
-# Daily ridership + weather: keep small/quick
-START_D, END_D = "2024-06-01", "2024-06-07"
+START_D, END_D = "2024-09-01", "2025-10-01"   # daily & weather ~ last 13 months
+START_H, END_H = "2025-08-01", "2025-10-01"   # hourly inside last 60 days window today
+START_E, END_E = "2024-01-01", "2025-10-01"   # events ~ last 21 months
 
-# Hourly subway: use 2025 (live dataset) – small but real
-START_H, END_H = "2025-03-18", "2025-03-19"
-
-# Events: full year (bigger = more likely to see signal)
-START_E, END_E = "2024-01-01", "2024-12-31"
 
 def main():
     # --- Extract ---
