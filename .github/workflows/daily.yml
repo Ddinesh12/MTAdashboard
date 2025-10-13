@@ -1,0 +1,42 @@
+name: Nightly ETL (NYC MTA)
+
+on:
+  schedule:
+    # Runs at 08:15 UTC every day (tweak as you like)
+    - cron: "15 8 * * *"
+  workflow_dispatch: {}  # allow manual runs from the Actions tab
+
+concurrency:
+  group: nightly-etl
+  cancel-in-progress: true
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+
+    env:
+      # Pass secrets in as env vars for the scripts to pick up
+      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+      SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+      NOAA_TOKEN: ${{ secrets.NOAA_TOKEN }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Idempotent: safe to run nightly; creates tables/views if missing
+      - name: Ensure schema & views exist
+        run: python init_db.py
+
+      - name: Run nightly daily job
+        run: python scripts/daily_job.py
