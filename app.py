@@ -1,5 +1,4 @@
-# app.py (replace file)
-
+# app.py
 import os
 from datetime import date, timedelta
 
@@ -20,23 +19,26 @@ def q(sql: str) -> pd.DataFrame:
     with engine.connect() as c:
         return pd.read_sql(sql, c)
 
-# ---------- helpers ----------
-def last(n: int) -> date:
-    return (date.today() - timedelta(days=n))
-
 def to_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s).dt.date
 
-# ---------- tabs ----------
-tab_overview, tab_hourly, tab_diags = st.tabs(["Overview", "Hourly patterns", "Diagnostics"])
+def last(n: int) -> date:
+    return date.today() - timedelta(days=n)
 
-# ======================================================================
-# 1) OVERVIEW
-# ======================================================================
+# ---------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------
+tab_overview, tab_hourly, tab_weather, tab_diags = st.tabs(
+    ["Overview", "Hourly patterns", "Weather & Events", "Diagnostics"]
+)
+
+# =====================================================================
+# OVERVIEW
+# =====================================================================
 with tab_overview:
-    st.header("Daily ridership (systemwide)")
+    st.header("Daily Ridership and Traffic")
 
-    # pull last-12 months w/ weather + events + rolling fields
+    # Pull a wide window so slider feels responsive
     daily = q("""
         select *
         from vw_ridership_daily_rolling
@@ -44,114 +46,88 @@ with tab_overview:
         order by date, mode
     """)
     if daily.empty:
-        st.info("No daily rows found. Did you run the backfill?")
+        st.info("No daily rows found. Run backfill first.")
         st.stop()
 
     daily["date"] = to_date(daily["date"])
 
-    # --- layout: main area (chart) + right filter rail  ----------------
-    col_main, col_filter = st.columns([4, 1])
-
-    with col_filter:
+    # Right-rail filters
+    main, rail = st.columns([4, 1])
+    with rail:
         st.subheader("Filters")
-        mode = st.radio("Mode", ["subway", "bus"], index=0, horizontal=True)
-        weather_on = st.toggle("Show weather markers (wet/hot/cold)", value=True)
-        events_on = st.toggle("Show events markers", value=True)
-
-        # slider bounds from data; default to last 365d
+        mode = st.radio("Mode", ["subway", "bus"], horizontal=True, index=0)
         dmin, dmax = daily["date"].min(), daily["date"].max()
-        default_start = max(dmin, last(365))
         drange = st.slider(
-            "Date range", min_value=dmin, max_value=dmax,
-            value=(default_start, dmax),
-            format="MMM d, YYYY"
+            "Date range",
+            min_value=dmin,
+            max_value=dmax,
+            value=(max(dmin, last(365)), dmax),
+            format="MMM d, YYYY",
         )
 
-    # filter by mode + range
-    df = daily[(daily["mode"] == mode) &
-               (daily["date"] >= drange[0]) &
-               (daily["date"] <= drange[1])].copy()
+    df = daily[
+        (daily["mode"] == mode)
+        & (daily["date"] >= drange[0])
+        & (daily["date"] <= drange[1])
+    ].copy()
 
-    # KPI cards (last business-ish day vs 28d baseline)
+    # KPI cards (latest vs 28d MA / 180d baseline)
     latest = df.sort_values("date").tail(1)
     if not latest.empty:
         c1, c2, c3 = st.columns(3)
         last_riders = int(latest["riders"].iloc[0])
-        ma28 = latest["riders_ma28"].iloc[0] or None
-        base180 = latest["riders_baseline_180"].iloc[0] or None
-        pct_vs_180 = None if not base180 else (last_riders - base180)/base180
-
+        ma28 = latest["riders_ma28"].iloc[0]
+        base180 = latest["riders_baseline_180"].iloc[0]
+        pct_vs_180 = None if not base180 else (last_riders - base180) / base180
         c1.metric(f"{mode.title()} riders (latest day)", f"{last_riders:,}")
-        c2.metric("28-day moving avg", f"{int(ma28):,}" if ma28 else "—")
+        c2.metric("28-day moving avg", f"{int(ma28):,}" if pd.notna(ma28) else "—")
         c3.metric("vs 180-day baseline", f"{pct_vs_180:+.1%}" if pct_vs_180 is not None else "—")
 
-    # Altair line w/ optional markers
+    # Clean line with optional 7d MA
     base = alt.Chart(df).encode(x="date:T")
     line = base.mark_line().encode(y=alt.Y("riders:Q", title="Riders"))
+    ma7 = base.mark_line(strokeDash=[4,3], opacity=0.8).encode(y=alt.Y("riders_ma7:Q", title="7-day MA"))
+    chart = alt.layer(line, ma7).properties(height=380)
 
-    ma7 = base.mark_line(strokeDash=[4,3], opacity=0.8).encode(
-        y=alt.Y("riders_ma7:Q", title="7d MA")
-    )
+    main.altair_chart(chart, use_container_width=True)
 
-    layers = [line, ma7]
-
-    if weather_on:
-        wet = base.transform_filter(alt.datum.wet_day == True).mark_point(size=30, shape="triangle-up").encode(
-            color=alt.value("#4e79a7"), tooltip=["date:T","tmax_f","prcp_in"]
-        )
-        hot = base.transform_filter(alt.datum.hot_day == True).mark_point(size=30, shape="circle").encode(
-            color=alt.value("#e15759"), tooltip=["date:T","tmax_f","prcp_in"]
-        )
-        cold = base.transform_filter(alt.datum.cold_day == True).mark_point(size=30, shape="diamond").encode(
-            color=alt.value("#76b7b2"), tooltip=["date:T","tmax_f","prcp_in"]
-        )
-        layers += [wet, hot, cold]
-
-    if events_on:
-        ev = base.transform_calculate(ev="toNumber(datum.event_count)").transform_filter(
-            alt.datum.ev > 0
-        ).mark_tick(size=30, thickness=2).encode(
-            y="riders:Q",
-            color=alt.value("#f28e2b"),
-            tooltip=["date:T", alt.Tooltip("event_count:Q", title="Events")]
-        )
-        layers.append(ev)
-
-    chart = alt.layer(*layers).properties(height=380)
-    col_main.altair_chart(chart, use_container_width=True)
-
-# ======================================================================
-# 2) HOURLY PATTERNS (Subway 2025+)
-# ======================================================================
+# =====================================================================
+# HOURLY PATTERNS
+# =====================================================================
 with tab_hourly:
     st.header("Subway hourly patterns (2025+)")
 
-    # tiny “left nav” inside the tab (two columns)
+    # mini left nav inside tab
     nav, area = st.columns([1, 4])
-
     with nav:
-        view = st.radio("Sections", ["Typical day profile", "Rush-hour multiplier"], index=0)
+        subview = st.radio("Sections", ["Typical day profile", "Rush-hour multiplier"])
 
-    # preload bases
     hourly60 = q("""
         select * from vw_hourly_last60
         order by date, hour, borough
     """)
     hourly60["date"] = to_date(hourly60["date"])
 
-    if view == "Typical day profile":
+    if subview == "Typical day profile":
         with area:
-            rcol, fcol = st.columns([4, 1])
-            with fcol:
-                borough = st.selectbox("Borough", ["Bronx","Brooklyn","Manhattan","Queens","Staten Island"], index=2)
-                kind = st.radio("Day type", ["Weekday", "Weekend"], index=0, horizontal=True)
+            plot, filt = st.columns([4, 1])
+            with filt:
+                borough = st.selectbox(
+                    "Borough",
+                    ["Bronx","Brooklyn","Manhattan","Queens","Staten Island"],
+                    index=2
+                )
+                daytype = st.radio("Day type", ["Weekday", "Weekend"], horizontal=True)
 
-            # compute mean by hour for selected borough + day type
-            is_wknd = (kind == "Weekend")
-            base = hourly60[(hourly60["borough"] == borough)]
-            base["is_weekend"] = pd.to_datetime(base["date"]).weekday.isin([5,6])
-            curve = (base[base["is_weekend"] == is_wknd]
-                     .groupby("hour", as_index=False)["riders"].mean())
+            base = hourly60[hourly60["borough"] == borough].copy()
+            base["is_weekend"] = pd.to_datetime(base["date"]).dt.weekday.isin([5, 6])  # <-- fix
+
+            want_wknd = (daytype == "Weekend")
+            curve = (
+                base[base["is_weekend"] == want_wknd]
+                .groupby("hour", as_index=False)["riders"]
+                .mean()
+            )
 
             if curve.empty:
                 st.warning("No rows for that selection in the last 60 days.")
@@ -161,7 +137,7 @@ with tab_hourly:
                     y=alt.Y("riders:Q", title="Avg riders"),
                     tooltip=["hour","riders"]
                 ).properties(height=380)
-                rcol.altair_chart(ch, use_container_width=True)
+                plot.altair_chart(ch, use_container_width=True)
 
     else:  # Rush-hour multiplier
         with area:
@@ -171,12 +147,12 @@ with tab_hourly:
                 order by date, borough
             """)
             rush["date"] = to_date(rush["date"])
-            boro_sel = st.multiselect(
+            sel = st.multiselect(
                 "Boroughs",
                 ["Bronx","Brooklyn","Manhattan","Queens","Staten Island"],
                 default=["Manhattan","Brooklyn","Queens"]
             )
-            rr = rush[rush["borough"].isin(boro_sel)].copy()
+            rr = rush[rush["borough"].isin(sel)].copy()
             if rr.empty:
                 st.warning("No rows for selected boroughs.")
             else:
@@ -184,26 +160,159 @@ with tab_hourly:
                     x="date:T",
                     y=alt.Y("rush_hour_multiplier:Q", title="Peak / Avg"),
                     color="borough:N",
-                    tooltip=["date:T","borough","peak_hourly","avg_hourly","rush_hour_multiplier"]
+                    tooltip=[
+                        "date:T","borough",
+                        alt.Tooltip("peak_hourly:Q", title="Peak"),
+                        alt.Tooltip("avg_hourly:Q",  title="Avg"),
+                        alt.Tooltip("rush_hour_multiplier:Q", title="Peak/Avg")
+                    ]
                 ).properties(height=380)
                 st.altair_chart(ch, use_container_width=True)
 
-# ======================================================================
-# 3) DIAGNOSTICS
-# ======================================================================
+# =====================================================================
+# WEATHER & EVENTS
+# =====================================================================
+with tab_weather:
+    st.header("Weather & Events")
+
+    # base: joined daily with weather + events (rolling view has flags)
+    base = q("""
+        select date, mode, riders, tmax_f, prcp_in, wet_day, hot_day, cold_day, coalesce(event_count,0) as event_count
+        from vw_ridership_daily_joined
+        where date >= current_date - interval '400 days'
+        order by date, mode
+    """)
+    if base.empty:
+        st.info("No daily rows available.")
+    else:
+        base["date"] = to_date(base["date"])
+
+        # --- 1) Ridership vs Temperature (scatter) --------------------
+        st.subheader("Ridership vs temperature (last 400 days)")
+        mcol, scol = st.columns([1, 4])
+        with mcol:
+            m = st.radio("Mode", ["subway","bus"], horizontal=True)
+        b = base[base["mode"] == m].copy()
+        if b.empty:
+            st.warning("No points for selection.")
+        else:
+            scat = alt.Chart(b).mark_point().encode(
+                x=alt.X("tmax_f:Q", title="Daily max temperature (°F)"),
+                y=alt.Y("riders:Q", title="Riders"),
+                color=alt.Color("wet_day:N", title="Wet day"),
+                tooltip=["date:T","riders:Q","tmax_f:Q","prcp_in:Q","wet_day:N"]
+            ).properties(height=300)
+            scol.altair_chart(scat, use_container_width=True)
+
+        st.divider()
+
+        # --- 2) Ridership on event days: boxplot ----------------------
+        st.subheader("Event vs non-event days (ridership distribution)")
+        bx = base[base["mode"] == m].copy()
+        bx["has_event"] = (bx["event_count"].fillna(0) > 0)
+        if bx.empty:
+            st.warning("No rows for selection.")
+        else:
+            box = alt.Chart(bx).mark_boxplot(extent="min-max").encode(
+                x=alt.X("has_event:N", title="Event day?"),
+                y=alt.Y("riders:Q", title=f"{m.title()} riders"),
+                color="has_event:N"
+            ).properties(height=280, width=300)
+            st.altair_chart(box, use_container_width=False)
+
+        st.divider()
+
+        # --- 3) Before/after case study (hourly) ----------------------
+        st.subheader("Case study: pick an event date → compare hourly curve vs median")
+        # choose dates (2025 only because hourly is 2025+)
+        ev = q("""
+            select date, sum(event_count)::int as events
+            from dim_events_daily
+            where date >= '2025-01-01'
+            group by date
+            having sum(event_count) > 0
+            order by events desc, date desc
+            limit 200
+        """)
+        ev["date"] = to_date(ev["date"])
+        if ev.empty:
+            st.info("No 2025+ event dates loaded yet.")
+        else:
+            sel_date = st.selectbox(
+                "Event date (2025+)",
+                options=ev["date"].tolist(),
+                format_func=lambda d: f"{d} (events={int(ev.loc[ev['date']==d,'events'].iloc[0])})"
+            )
+
+            # Get hourly for chosen date (systemwide = sum across boroughs)
+            h = q(f"""
+                select date, hour, borough, riders
+                from fact_subway_hourly
+                where date = '{sel_date}'
+                order by hour, borough
+            """)
+            h["date"] = to_date(h["date"])
+
+            if h.empty:
+                st.warning("No hourly subway rows for that date.")
+            else:
+                day_curve = (
+                    h.groupby("hour", as_index=False)["riders"]
+                     .sum()
+                     .rename(columns={"riders":"riders_event"})
+                )
+
+                # 60-day median per hour (excluding that date)
+                med = q(f"""
+                    select hour, percentile_cont(0.5) within group (order by riders) as med_riders
+                    from (
+                        select date, hour, sum(riders) as riders
+                        from fact_subway_hourly
+                        where date >= '{sel_date}'::date - interval '60 days'
+                          and date <  '{sel_date}'::date
+                        group by date, hour
+                    ) t
+                    group by hour
+                    order by hour
+                """)
+
+                comp = day_curve.merge(med, on="hour", how="left")
+                if comp.empty:
+                    st.warning("No baseline window to compare.")
+                else:
+                    c1, c2 = st.columns(2)
+                    # event day line
+                    ch1 = alt.Chart(comp).mark_line(point=True).encode(
+                        x=alt.X("hour:O", title="Hour"),
+                        y=alt.Y("riders_event:Q", title="Riders"),
+                        tooltip=["hour","riders_event"]
+                    ).properties(title=f"{sel_date} — event day", height=300)
+                    # median line
+                    ch2 = alt.Chart(comp).mark_line(point=True).encode(
+                        x=alt.X("hour:O", title="Hour"),
+                        y=alt.Y("med_riders:Q", title="Riders"),
+                        tooltip=["hour","med_riders"]
+                    ).properties(title="Typical median (last 60d)", height=300)
+                    c1.altair_chart(ch1, use_container_width=True)
+                    c2.altair_chart(ch2, use_container_width=True)
+
+# =====================================================================
+# DIAGNOSTICS
+# =====================================================================
 with tab_diags:
     st.subheader("Diagnostics")
-    # show any SQL error nicely
+
     try:
         counts = q("""
-            with d as (select 'fact_ridership_daily'::text as t, count(*)::bigint as n from fact_ridership_daily)
-            union all select 'dim_weather_daily',count(*) from dim_weather_daily
-            union all select 'fact_subway_hourly',count(*) from fact_subway_hourly
-            union all select 'dim_events_daily', count(*) from dim_events_daily
+            with t1 as (select 'fact_ridership_daily'::text as table, count(*)::bigint as rows from fact_ridership_daily),
+                 t2 as (select 'dim_weather_daily', count(*) from dim_weather_daily),
+                 t3 as (select 'fact_subway_hourly', count(*) from fact_subway_hourly),
+                 t4 as (select 'dim_events_daily',  count(*) from dim_events_daily)
+            select * from t1 union all select * from t2 union all select * from t3 union all select * from t4
         """)
         st.dataframe(counts, use_container_width=True, hide_index=True)
     except Exception as e:
-        st.warning(f"Query failed: {getattr(e, 'orig', e)}")
+        st.warning("Counts query failed.")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.caption("ridership_daily (latest 5)")
