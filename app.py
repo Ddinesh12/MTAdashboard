@@ -3,9 +3,11 @@ import os
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+import numpy as np
 import sqlalchemy as sa
 import streamlit as st
 import altair as alt
+import requests
 from dotenv import load_dotenv
 
 # -----------------------------
@@ -13,6 +15,7 @@ from dotenv import load_dotenv
 # -----------------------------
 load_dotenv()
 engine = sa.create_engine(os.environ["NEON_DATABASE_URL"], pool_pre_ping=True)
+SOCRATA_TOKEN = os.getenv("SOCRATA_APP_TOKEN")
 
 st.set_page_config(page_title="NYC MTA Dashboard", layout="wide")
 
@@ -25,6 +28,9 @@ def pct(a, b):
     if b in (0, None) or pd.isna(b):
         return None
     return (a - b) / b
+
+def to_pydate(d):
+    return pd.to_datetime(d).to_pydatetime()
 
 # -----------------------------
 # Sidebar (left nav)
@@ -67,8 +73,8 @@ if page == "Overview":
 
     dmin = daily["date"].min()
     dmax = daily["date"].max()
-    min_dt = pd.to_datetime(dmin).to_pydatetime()
-    max_dt = pd.to_datetime(dmax).to_pydatetime()
+    min_dt = to_pydate(dmin)
+    max_dt = to_pydate(dmax)
     default_start = max_dt - timedelta(days=365)
 
     st.caption("Select a start and end date")
@@ -199,7 +205,14 @@ elif page == "Weather & Events":
         where date >= (current_date - interval '400 days')
         order by date, mode
     """)
-    d = daily[daily["mode"] == mode].dropna(subset=["tmax_f", "riders"])
+    d = daily[daily["mode"] == mode].copy()
+    # ensure numeric for Altair
+    d["tmax_f"] = pd.to_numeric(d["tmax_f"], errors="coerce")
+    d["riders"] = pd.to_numeric(d["riders"], errors="coerce")
+    d = d.dropna(subset=["tmax_f", "riders"])
+
+    # add a friendly label for color
+    d["wet_label"] = np.where(d["wet_day"] == True, "Wet day", "Dry day")
 
     if d.empty:
         st.info("No daily rows available yet.")
@@ -210,12 +223,10 @@ elif page == "Weather & Events":
             .encode(
                 x=alt.X("tmax_f:Q", title="Max temperature (°F)"),
                 y=alt.Y("riders:Q", title=f"{mode.title()} riders"),
-                color=alt.condition(
-                    alt.datum.wet_day == True, alt.value("#1f77b4"), alt.value("#aaa")
-                ),
-                tooltip=["date:T", "riders:Q", "tmax_f:Q", "wet_day:N", "event_count:Q"],
+                color=alt.Color("wet_label:N", title=""),
+                tooltip=["date:T", "riders:Q", "tmax_f:Q", "wet_label:N", "event_count:Q"],
             )
-            .properties(height=360, use_container_width=True)
+            .properties(height=360)
         )
         st.altair_chart(scatter, use_container_width=True)
 
@@ -224,22 +235,22 @@ elif page == "Weather & Events":
     if d.empty:
         st.info("No data for boxplot.")
     else:
-        d = d.copy()
-        d["has_event"] = (d["event_count"].fillna(0) > 0).map({True: "≥1 event", False: "0 events"})
+        d2 = d.copy()
+        d2["has_event"] = np.where(d2["event_count"].fillna(0) > 0, "≥1 event", "0 events")
         box = (
-            alt.Chart(d)
+            alt.Chart(d2)
             .mark_boxplot(extent="min-max")
             .encode(
                 x=alt.X("has_event:N", title="Event day"),
                 y=alt.Y("riders:Q", title=f"{mode.title()} riders"),
-                color="has_event:N",
+                color=alt.Color("has_event:N", title=""),
                 tooltip=["has_event:N", "riders:Q"]
             )
-            .properties(height=320, use_container_width=True)
+            .properties(height=320)
         )
         st.altair_chart(box, use_container_width=True)
 
-    # ---- BEFORE/AFTER CASE STUDY
+    # ---- BEFORE/AFTER CASE STUDY (with on-demand event list)
     st.subheader("Case study: high-event day vs typical profile (subway)")
 
     # Top event dates (sum across boroughs) to choose from
@@ -290,32 +301,24 @@ elif page == "Weather & Events":
             )
 
             # median baseline for same weekday
+            baseline = None
             if not hr_base.empty:
                 hr_base["date"] = pd.to_datetime(hr_base["date"])
                 target_dow = pd.Timestamp(sel_date).dayofweek
                 same_dow = hr_base[hr_base["date"].dt.dayofweek == target_dow]
-                if same_dow.empty:
-                    col2.info("No baseline rows for the same weekday in the previous 60 days.")
-                    baseline = None
-                else:
-                    daily_totals = (
-                        same_dow.groupby(["date", "hour"], as_index=False)["riders"].sum()
-                    )
+                if not same_dow.empty:
+                    daily_totals = same_dow.groupby(["date", "hour"], as_index=False)["riders"].sum()
                     baseline = (
                         daily_totals.groupby("hour", as_index=False)["riders"].median()
                         .rename(columns={"riders": "riders_median"})
                     )
-            else:
-                baseline = None
 
-            # Merge day + baseline (if present)
             if baseline is not None:
                 merged = pd.merge(h1, baseline, on="hour", how="outer").sort_values("hour")
             else:
                 merged = h1.copy()
                 merged["riders_median"] = pd.NA
 
-            # Altair multi-line chart
             melted = merged.melt("hour", var_name="series", value_name="riders")
             line = (
                 alt.Chart(melted)
@@ -326,13 +329,33 @@ elif page == "Weather & Events":
                     color=alt.Color("series:N", title=None),
                     tooltip=["hour:O", "series:N", "riders:Q"]
                 )
-                .properties(height=350, use_container_width=True)
+                .properties(height=350)
             )
             col1.altair_chart(line, use_container_width=True)
 
             with col2:
                 st.caption(f"Selected date: **{sel_date}** — day vs. median of same weekday (prior 60 days)")
                 st.dataframe(merged, use_container_width=True)
+
+        # --- On-demand event list for the selected date (no schema change)
+        st.subheader("Events on selected date (on-demand from NYC Open Data)")
+        with st.spinner("Fetching events…"):
+            ev_df = None
+            try:
+                ev_df = fetch_events_for_date(sel_date, SOCRATA_TOKEN)
+            except Exception as ex:
+                st.error(f"Failed to fetch events: {ex}")
+
+        if ev_df is None or ev_df.empty:
+            st.info("No events found for that date in the source dataset.")
+        else:
+            # Light formatting for readability
+            show = ev_df[[
+                "event_name", "event_type", "event_borough", "event_location",
+                "start_date_time", "end_date_time", "street_closure_type",
+                "community_board", "police_precinct"
+            ]].copy()
+            st.dataframe(show, use_container_width=True)
 
     with st.expander("Raw daily rows (last 14)"):
         st.dataframe(
@@ -381,3 +404,47 @@ else:
         e = q("""select * from dim_events_daily order by date desc, borough limit 5""")
         st.caption("events_daily (latest 5)")
         st.dataframe(e, use_container_width=True)
+
+
+# -----------------------------
+# Helper: on-demand events fetch
+# -----------------------------
+def fetch_events_for_date(the_date: date, token: str | None) -> pd.DataFrame:
+    """
+    On-demand pull of event details for a given calendar date from NYC Open Data
+    dataset `tvpp-9vvx` (NYC Permitted Event Information).
+    """
+    base = "https://data.cityofnewyork.us/resource/tvpp-9vvx.json"
+    start_iso = f"{the_date}T00:00:00"
+    end_iso   = f"{the_date}T23:59:59"
+
+    # include events that start OR end that day OR span across the day
+    where = (
+        f"(start_date_time between '{start_iso}' and '{end_iso}') OR "
+        f"(end_date_time between '{start_iso}' and '{end_iso}') OR "
+        f"(start_date_time <= '{end_iso}' AND end_date_time >= '{start_iso}')"
+    )
+
+    params = {
+        "$select": "event_id,event_name,event_type,event_borough,event_location,street_closure_type,"
+                   "community_board,police_precinct,start_date_time,end_date_time",
+        "$where": where,
+        "$limit": 5000,
+        "$order": "start_date_time"
+    }
+    headers = {"User-Agent": "nyc-mta-dashboard/0.1"}
+    if token:
+        headers["X-App-Token"] = token
+
+    r = requests.get(base, params=params, headers=headers, timeout=45)
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame.from_records(rows)
+    # Best-effort parsing
+    for c in ["start_date_time", "end_date_time"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
