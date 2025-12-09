@@ -59,9 +59,6 @@ def _http_get(url: str, params: Dict[str, Any], headers: Dict[str, str], max_ret
     - If it gets a 200 OK, returns the parsed JSON immediately.
     - If it gets a non-transient error (e.g. 400), it raises an exception.
     - After exhausting retries, it makes one final attempt and raises if that fails.
-
-    In interview terms:
-    > "This helps the ETL be resilient to rate limiting and temporary API outages."
     """
     for attempt in range(1, max_retries + 1):
         r = requests.get(url, params=params, headers=headers, timeout=60)
@@ -112,7 +109,6 @@ def _normalize_borough(series: pd.Series) -> pd.Series:
     - Use BORO_MAP to map codes/variants (MN, BROOKLYN, etc.) into a standard name.
     - Anything not in VALID_BOROUGHS is set to NaN and dropped later.
 
-    This means downstream we only work with: Bronx, Brooklyn, Manhattan, Queens, Staten Island.
     """
     b = series.astype(str).str.strip()
     b = b.map(lambda s: BORO_MAP.get(s.upper(), s.title()))
@@ -301,9 +297,7 @@ def fetch_events_daily(start_date: str, end_date: str, app_token: Optional[str] 
     - Calls `_fetch_events` to do the heavy lifting (paging, parsing, grouping).
     - Returns a clean DataFrame with columns: date, borough, event_count.
 
-    In interview terms:
     > "This is the function my ETL calls to get a daily
-    > `date, borough, event_count` table that I then join into my warehouse."
     """
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     tok = app_token or os.getenv("SOCRATA_APP_TOKEN")
